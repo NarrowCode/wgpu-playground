@@ -1,5 +1,5 @@
 use std::iter;
-
+use wgpu::util::DeviceExt;
 use wgpu::{include_wgsl, Device};
 use winit::{
     event::*,
@@ -10,6 +10,61 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+// Vertex buffer that stores arbitrary vertex data
+// repr essentially tells Rust to forego "compiler magic" and keep the layout of the
+// struct like we specify here, and translate some stuff that doesn't work in C accordingly
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            // Defines the width of the vertex in bytes
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            // Each element in our array defines vertex data
+            step_mode: wgpu::VertexStepMode::Vertex,
+            // Individual attributes of the vertex, mapping of struct values
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,                             // Offset in bytes until attribute start
+                    shader_location: 0, // Location corresponding with @location(0) in our shader
+                    format: wgpu::VertexFormat::Float32x3, // Shape of the attribute
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        }
+    }
+}
+
+// Alternative to the derived traits
+// unsafe impl bytemuck::Pod for Vertex {}
+// unsafe impl bytemuck::Zeroable for Vertex {}
+
+// Since the specified front_face was
+// front_face: wgpu::FrontFace::Ccw, we need to list these vertices in clockwise order
+const VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [0.0, 0.5, 0.0],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.0],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.0],
+        color: [1.0, 0.0, 1.0],
+    },
+];
+
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -17,8 +72,9 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     background_color: wgpu::Color,
-
     render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    num_vertices: u32,
 }
 
 impl State {
@@ -27,7 +83,8 @@ impl State {
 
         // The instance allows us to talk to our GPU
         // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        let instance = wgpu::Instance::new(wgpu::Backends::METAL);
+        // TODO: Investigate why backend BROWSER_WEBGPU doesn't actually work here
+        let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
 
         // The surface is how we draw to the screen (using raw-window-handle)
         let surface = unsafe { instance.create_surface(window) };
@@ -51,14 +108,14 @@ impl State {
                 &wgpu::DeviceDescriptor {
                     label: None,
                     features: wgpu::Features::empty(),
-                    limits: wgpu::Limits::default(),
+                    //limits: wgpu::Limits::default(),
                     // WebGL doesn't support all of wgpu's features, so if
                     // we're building for the web we'll have to disable some.
-                    //limits: if cfg!(target_arch = "wasm32") {
-                    //    wgpu::Limits::downlevel_webgl2_defaults()
-                    //} else {
-                    //    wgpu::Limits::default()
-                    //},
+                    limits: if cfg!(target_arch = "wasm32") {
+                        wgpu::Limits::downlevel_webgl2_defaults()
+                    } else {
+                        wgpu::Limits::default()
+                    },
                 },
                 // Some(&std::path::Path::new("trace")), // Trace path
                 None,
@@ -92,7 +149,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[], // Here we could specify vertices that are passed to the vs_main shader
+                buffers: &[Vertex::desc()], // Here we could specify vertices that are passed to the vs_main shader
             },
             fragment: Some(wgpu::FragmentState {
                 // This must be wrapped in Some(), since it's optional
@@ -124,6 +181,13 @@ impl State {
             multiview: None,
         });
 
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let num_vertices = VERTICES.len() as u32;
         let background_color = wgpu::Color::BLACK;
         Self {
             surface,
@@ -133,6 +197,8 @@ impl State {
             size,
             background_color,
             render_pipeline,
+            vertex_buffer,
+            num_vertices,
         }
     }
 
@@ -199,7 +265,9 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..3, 0..1); // Draw with 3 vertices in 1 instance
+            // We use the entire vertex buffer for this render_pass
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.draw(0..self.num_vertices, 0..1); // Draw with 3 vertices in 1 instance
         } // Here we release our borrow on the encoder, so we can finish
 
         self.queue.submit(iter::once(encoder.finish()));
